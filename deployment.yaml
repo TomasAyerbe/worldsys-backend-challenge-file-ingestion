@@ -1,0 +1,426 @@
+# -----------------------------------------------------------------------------
+# 1. Namespace
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: file-ingestion
+  labels:
+    app.kubernetes.io/part-of: file-ingestion
+
+---
+# -----------------------------------------------------------------------------
+# 2. ConfigMap — Configuración de la aplicación
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: file-ingestion
+  labels:
+    app.kubernetes.io/name: file-ingestion-app
+    app.kubernetes.io/part-of: file-ingestion
+    app.kubernetes.io/component: backend
+data:
+  APP_ENV: 'production'
+  DB_SERVER: 'sqlserver'
+  DB_PORT: '1433'
+  DB_NAME: 'challenge_db'
+  LOG_LEVEL: 'info'
+  PORT: '3000'
+
+---
+# -----------------------------------------------------------------------------
+# 3. Secret — Credenciales de SQL Server
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+  namespace: file-ingestion
+  labels:
+    app.kubernetes.io/part-of: file-ingestion
+type: Opaque
+stringData:
+  DB_USER: 'sa'
+  DB_PASSWORD: 'JhQxInScWm!'
+  MSSQL_SA_PASSWORD: 'JhQxInScWm!'
+
+---
+# -----------------------------------------------------------------------------
+# 4. ConfigMap — Script SQL de inicialización (DDL)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sql-init-script
+  namespace: file-ingestion
+  labels:
+    app.kubernetes.io/part-of: file-ingestion
+    app.kubernetes.io/component: database
+data:
+  init.sql: |
+    IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'$(DB_NAME)')
+    BEGIN
+        CREATE DATABASE [$(DB_NAME)];
+    END
+    GO
+
+    USE [$(DB_NAME)];
+    GO
+
+    IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[clients]') AND type = N'U')
+    BEGIN
+        CREATE TABLE [dbo].[clients] (
+            Id               INT IDENTITY(1,1) PRIMARY KEY,
+            NombreCompleto   NVARCHAR(100) NOT NULL,
+            DNI              BIGINT        NOT NULL,
+            Estado           VARCHAR(10)   NOT NULL,
+            FechaIngreso     DATE          NOT NULL,
+            EsPEP            BIT           NOT NULL,
+            EsSujetoObligado BIT           NULL,
+            FechaCreacion    DATETIME      NOT NULL
+        );
+    END
+    GO
+
+---
+# -----------------------------------------------------------------------------
+# 5. PersistentVolumeClaim — Datos de SQL Server
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sqlserver-data
+  namespace: file-ingestion
+  labels:
+    app.kubernetes.io/part-of: file-ingestion
+    app.kubernetes.io/component: database
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+# -----------------------------------------------------------------------------
+# 6. PersistentVolumeClaim — Archivo de entrada (.dat)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: input-data
+  namespace: file-ingestion
+  labels:
+    app.kubernetes.io/part-of: file-ingestion
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 2Gi
+
+---
+# -----------------------------------------------------------------------------
+# 7. Deployment — SQL Server
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sqlserver
+  namespace: file-ingestion
+  labels:
+    app.kubernetes.io/name: sqlserver
+    app.kubernetes.io/part-of: file-ingestion
+    app.kubernetes.io/component: database
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sqlserver
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sqlserver
+        app.kubernetes.io/part-of: file-ingestion
+        app.kubernetes.io/component: database
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: sqlserver
+          image: mcr.microsoft.com/azure-sql-edge
+          ports:
+            - containerPort: 1433
+              protocol: TCP
+              name: tds
+          env:
+            - name: ACCEPT_EULA
+              value: 'Y'
+            - name: MSSQL_SA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: MSSQL_SA_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /var/opt/mssql
+          resources:
+            requests:
+              memory: '512Mi'
+              cpu: '250m'
+            limits:
+              memory: '1Gi'
+              cpu: '500m'
+          startupProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - '/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -Q "SELECT 1" -b'
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - '/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -Q "SELECT 1" -b'
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - '/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -Q "SELECT 1" -b'
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: sqlserver-data
+
+---
+# -----------------------------------------------------------------------------
+# 8. Service — SQL Server
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: sqlserver
+  namespace: file-ingestion
+  labels:
+    app.kubernetes.io/name: sqlserver
+    app.kubernetes.io/part-of: file-ingestion
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sqlserver
+  ports:
+    - port: 1433
+      targetPort: tds
+      protocol: TCP
+      name: tds
+
+---
+# -----------------------------------------------------------------------------
+# 9. Job — Migración de base de datos
+# -----------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  namespace: file-ingestion
+  labels:
+    app.kubernetes.io/name: db-migrate
+    app.kubernetes.io/part-of: file-ingestion
+    app.kubernetes.io/component: migration
+spec:
+  backoffLimit: 5
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: db-migrate
+        app.kubernetes.io/part-of: file-ingestion
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-for-db
+          image: mcr.microsoft.com/mssql-tools
+          command: ['/bin/bash', '-c']
+          args:
+            - |
+              echo "Waiting for SQL Server to be available..."
+              until /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P "$DB_PASSWORD" -Q "SELECT 1" -b 2>/dev/null; do
+                echo "SQL Server is not available yet. Retrying in 5 seconds..."
+                sleep 5
+              done
+              echo "SQL Server is available."
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: DB_PASSWORD
+          resources:
+            requests:
+              memory: '32Mi'
+              cpu: '25m'
+            limits:
+              memory: '64Mi'
+              cpu: '50m'
+      containers:
+        - name: migrate
+          image: mcr.microsoft.com/mssql-tools
+          command: ['/bin/bash', '-c']
+          args:
+            - /opt/mssql-tools/bin/sqlcmd -S sqlserver -U sa -P "$DB_PASSWORD" -v DB_NAME="$DB_NAME" -i /scripts/init.sql
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: DB_PASSWORD
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: DB_NAME
+          volumeMounts:
+            - name: init-script
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              memory: '32Mi'
+              cpu: '25m'
+            limits:
+              memory: '64Mi'
+              cpu: '50m'
+      volumes:
+        - name: init-script
+          configMap:
+            name: sql-init-script
+
+---
+# -----------------------------------------------------------------------------
+# 10. Deployment — Aplicación Node.js
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-ingestion-app
+  namespace: file-ingestion
+  labels:
+    app.kubernetes.io/name: file-ingestion-app
+    app.kubernetes.io/part-of: file-ingestion
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: file-ingestion-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: file-ingestion-app
+        app.kubernetes.io/part-of: file-ingestion
+        app.kubernetes.io/component: backend
+    spec:
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: app
+          image: file-ingestion-app:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+              protocol: TCP
+              name: http
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: db-credentials
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: '128Mi'
+              cpu: '100m'
+            limits:
+              memory: '256Mi'
+              cpu: '200m'
+          volumeMounts:
+            - name: input-data
+              mountPath: /app/data
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: input-data
+          persistentVolumeClaim:
+            claimName: input-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 50Mi
+
+---
+# -----------------------------------------------------------------------------
+# 11. Service — Aplicación
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: file-ingestion-app
+  namespace: file-ingestion
+  labels:
+    app.kubernetes.io/name: file-ingestion-app
+    app.kubernetes.io/part-of: file-ingestion
+    app.kubernetes.io/component: backend
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: file-ingestion-app
+  ports:
+    - port: 3000
+      targetPort: http
+      protocol: TCP
+      name: http

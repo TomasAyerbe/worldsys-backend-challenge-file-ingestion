@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.gitignore
+.idea
+.claude
+.env
+.env.local
+*.md
+data-generator
+docker-compose.yml
+scripts

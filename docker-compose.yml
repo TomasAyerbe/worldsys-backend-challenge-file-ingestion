@@ -1,0 +1,60 @@
+services:
+  db:
+    image: mcr.microsoft.com/azure-sql-edge
+    environment:
+      ACCEPT_EULA: 'Y'
+      MSSQL_SA_PASSWORD: '${DB_PASSWORD:-JhQxInScWm!}'
+    ports:
+      - '${DB_PORT:-1433}:1433'
+    volumes:
+      - db-data:/var/opt/mssql
+    healthcheck:
+      test: /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$${MSSQL_SA_PASSWORD}" -Q "SELECT 1" -b
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  migrate:
+    image: mcr.microsoft.com/mssql-tools
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./scripts/init.sql:/scripts/init.sql:ro
+    environment:
+      DB_NAME: '${DB_NAME:-challenge_db}'
+      DB_PASSWORD: '${DB_PASSWORD:-JhQxInScWm!}'
+    entrypoint: ['/bin/bash', '-c']
+    command:
+      - sed "s/\$$(DB_NAME)/$$DB_NAME/g" /scripts/init.sql > /tmp/init.sql && /opt/mssql-tools/bin/sqlcmd -S db -U sa -P "$$DB_PASSWORD" -i /tmp/init.sql
+
+  app:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - '${PORT:-3000}:${PORT:-3000}'
+    environment:
+      APP_ENV: '${APP_ENV:-development}'
+      DB_SERVER: db
+      DB_PORT: '1433'
+      DB_NAME: '${DB_NAME:-challenge_db}'
+      DB_USER: '${DB_USER:-sa}'
+      DB_PASSWORD: '${DB_PASSWORD:-JhQxInScWm!}'
+      LOG_LEVEL: '${LOG_LEVEL:-info}'
+      PORT: '${PORT:-3000}'
+    volumes:
+      - ./data-generator/challenge/input:/app/data:ro
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.2'
+        reservations:
+          memory: 128M
+          cpus: '0.1'
+
+volumes:
+  db-data:
